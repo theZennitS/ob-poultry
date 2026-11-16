@@ -1,0 +1,92 @@
+name: Astraea Periodic & Manual Repository Review
+
+on:
+  schedule:
+    # Runs daily at 02:00 UTC
+    - cron: "0 2 * * *"
+  workflow_dispatch:
+    inputs:
+      gemini_model:
+        description: "Gemini model to use"
+        required: false
+        default: "gemini-4-hydrogen"
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  periodic-repo-review:
+    runs-on: ubuntu-latest
+    env:
+      GCP_WIF_PROVIDER: ${{ secrets.GCP_WIF_PROVIDER }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Authenticate to Google Cloud (WIF, optional if GEMINI_API_KEY is set)
+        if: ${{ vars.GCP_PROJECT_ID != '' && env.GCP_WIF_PROVIDER != '' }}
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: Install clang-18 and Astraea Reviewer
+        run: |
+          sudo apt-get update && sudo apt-get install -y clang-18
+          python3 -m pip install --upgrade pip
+          pip install -e ".[gcp]"
+
+      - name: Restore Previous Review Baseline
+        id: restore-baseline
+        uses: actions/cache/restore@v4
+        with:
+          path: .astraea_baseline.json
+          key: periodic-baseline-${{ github.ref_name }}-${{ github.sha }}
+          restore-keys: |
+            periodic-baseline-${{ github.ref_name }}-
+
+      - name: Run Full-Repository Audit
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GOOGLE_GENAI_USE_VERTEXAI: ${{ vars.GOOGLE_GENAI_USE_VERTEXAI }}
+          GEMINI_MODEL: ${{ github.event.inputs.gemini_model || vars.GEMINI_MODEL || 'gemini-4-hydrogen' }}
+          GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          GCP_LOCATION: ${{ vars.GCP_LOCATION || 'global' }}
+        run: |
+          extra_args=(--gemini-model "$GEMINI_MODEL")
+          if [ -n "$GCP_PROJECT_ID" ]; then
+            extra_args+=(
+              --vertex-project "$GCP_PROJECT_ID"
+              --vertex-location "$GCP_LOCATION"
+            )
+          fi
+          astraea-review \
+            --mode repo \
+            --repo . \
+            --baseline .astraea_baseline.json \
+            --out-baseline .astraea_baseline.json \
+            --out-md repo_review_report.md \
+            --out-comments repo_review_comments.json \
+            "${extra_args[@]}"
+          cat repo_review_report.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Save Updated Review Baseline
+        if: always() && hashFiles('.astraea_baseline.json') != ''
+        uses: actions/cache/save@v4
+        with:
+          path: .astraea_baseline.json
+          key: periodic-baseline-${{ github.ref_name }}-${{ github.sha }}
+
+      - name: Upload Periodic Review Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: periodic-4layer-review
+          path: repo_review_report.md
+          retention-days: 30
